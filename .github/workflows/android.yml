@@ -1,0 +1,299 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Organize files
+        run: |
+          mkdir -p www assets native www/fonts
+          for f in index.html styles.css app.js sw.js manifest.json icon.svg icon-512.png privacy.html; do [ -f "$f" ] && mv "$f" www/ || true; done
+          for f in icon-only.png icon-foreground.png icon-background.png; do [ -f "$f" ] && mv "$f" assets/ || true; done
+          B=https://github.com/google/fonts/raw/main/ofl
+          curl -fsSL "$B/amiriquran/AmiriQuran-Regular.ttf" -o www/fonts/AmiriQuran-Regular.ttf || true
+          for w in Regular Medium Bold; do curl -fsSL "$B/tajawal/Tajawal-$w.ttf" -o "www/fonts/Tajawal-$w.ttf" || true; done
+          ls www assets
+
+      - name: Write native Android files
+        run: |
+          cat > native/MediaCtlPlugin.java <<'EOF_MEDIACTLPLUGIN_JAVA'
+          package __PKG__;
+
+          import android.content.Intent;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          @CapacitorPlugin(name = "MediaCtl")
+          public class MediaCtlPlugin extends Plugin {
+              static MediaCtlPlugin inst;
+
+              @Override
+              public void load() {
+                  inst = this;
+              }
+
+              @PluginMethod
+              public void update(PluginCall call) {
+                  Intent i = new Intent(getContext(), MediaService.class);
+                  i.putExtra("title", call.getString("title", ""));
+                  i.putExtra("text", call.getString("text", ""));
+                  i.putExtra("playing", Boolean.TRUE.equals(call.getBoolean("playing", false)));
+                  try {
+                      ContextCompat.startForegroundService(getContext(), i);
+                  } catch (Exception e) {
+                      try {
+                          getContext().startService(i);
+                      } catch (Exception e2) {
+                          // ignore: app not allowed to start the service right now
+                      }
+                  }
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void stop(PluginCall call) {
+                  try {
+                      getContext().stopService(new Intent(getContext(), MediaService.class));
+                  } catch (Exception e) {
+                      // ignore
+                  }
+                  call.resolve();
+              }
+
+              static void emit(String action) {
+                  if (inst != null) {
+                      JSObject o = new JSObject();
+                      o.put("action", action);
+                      inst.notifyListeners("action", o);
+                  }
+              }
+          }
+          EOF_MEDIACTLPLUGIN_JAVA
+          cat > native/MediaService.java <<'EOF_MEDIASERVICE_JAVA'
+          package __PKG__;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.media.MediaMetadata;
+          import android.media.session.MediaSession;
+          import android.media.session.PlaybackState;
+          import android.os.Build;
+          import android.os.IBinder;
+
+          public class MediaService extends Service {
+              static final String CH = "mushaf_media";
+              static final int ID = 4711;
+              private MediaSession session;
+              private String title = "";
+              private String text = "";
+              private boolean playing = false;
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel c = new NotificationChannel(CH, "التشغيل الصوتي", NotificationManager.IMPORTANCE_LOW);
+                      c.setShowBadge(false);
+                      ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(c);
+                  }
+                  session = new MediaSession(this, "MushafMedia");
+                  session.setCallback(new MediaSession.Callback() {
+                      @Override public void onPlay() { MediaCtlPlugin.emit("play"); }
+                      @Override public void onPause() { MediaCtlPlugin.emit("pause"); }
+                      @Override public void onSkipToNext() { MediaCtlPlugin.emit("next"); }
+                      @Override public void onSkipToPrevious() { MediaCtlPlugin.emit("prev"); }
+                      @Override public void onStop() { MediaCtlPlugin.emit("stop"); }
+                  });
+                  session.setActive(true);
+              }
+
+              @Override
+              public int onStartCommand(Intent in, int flags, int startId) {
+                  String a = in == null ? null : in.getAction();
+                  if (a != null && a.startsWith("act:")) {
+                      String act = a.substring(4);
+                      MediaCtlPlugin.emit(act);
+                      if ("stop".equals(act)) {
+                          stopForeground(true);
+                          stopSelf();
+                      }
+                      return START_NOT_STICKY;
+                  }
+                  if (in != null) {
+                      String t = in.getStringExtra("title");
+                      String x = in.getStringExtra("text");
+                      title = t == null ? "" : t;
+                      text = x == null ? "" : x;
+                      playing = in.getBooleanExtra("playing", false);
+                  }
+                  show();
+                  return START_NOT_STICKY;
+              }
+
+              private Notification.Action act(int icon, String label, String a, int code) {
+                  Intent i = new Intent(this, MediaService.class).setAction("act:" + a);
+                  PendingIntent pi = PendingIntent.getService(this, code, i,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  return new Notification.Action.Builder(icon, label, pi).build();
+              }
+
+              private void show() {
+                  long actions = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE
+                          | PlaybackState.ACTION_SKIP_TO_NEXT | PlaybackState.ACTION_SKIP_TO_PREVIOUS | PlaybackState.ACTION_STOP;
+                  session.setPlaybackState(new PlaybackState.Builder()
+                          .setActions(actions)
+                          .setState(playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,
+                                  PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1f)
+                          .build());
+                  session.setMetadata(new MediaMetadata.Builder()
+                          .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+                          .putString(MediaMetadata.METADATA_KEY_ARTIST, text)
+                          .build());
+
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                          ? new Notification.Builder(this, CH) : new Notification.Builder(this);
+                  b.setSmallIcon(R.drawable.ic_stat_mushaf)
+                          .setContentTitle(title)
+                          .setContentText(text)
+                          .setOnlyAlertOnce(true)
+                          .setShowWhen(false)
+                          .setOngoing(playing)
+                          .setVisibility(Notification.VISIBILITY_PUBLIC);
+                  Intent launch = getPackageManager().getLaunchIntentForPackage(getPackageName());
+                  if (launch != null) {
+                      b.setContentIntent(PendingIntent.getActivity(this, 0, launch,
+                              PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
+                  }
+                  b.addAction(act(android.R.drawable.ic_media_previous, "السابق", "prev", 1));
+                  if (playing) {
+                      b.addAction(act(android.R.drawable.ic_media_pause, "إيقاف مؤقت", "pause", 2));
+                  } else {
+                      b.addAction(act(android.R.drawable.ic_media_play, "تشغيل", "play", 2));
+                  }
+                  b.addAction(act(android.R.drawable.ic_media_next, "التالي", "next", 3));
+                  b.addAction(act(android.R.drawable.ic_menu_close_clear_cancel, "إغلاق", "stop", 4));
+                  b.setStyle(new Notification.MediaStyle()
+                          .setMediaSession(session.getSessionToken())
+                          .setShowActionsInCompactView(0, 1, 2));
+                  Notification n = b.build();
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                  } else {
+                      startForeground(ID, n);
+                  }
+              }
+
+              @Override
+              public void onTaskRemoved(Intent rootIntent) {
+                  stopForeground(true);
+                  stopSelf();
+                  super.onTaskRemoved(rootIntent);
+              }
+
+              @Override
+              public void onDestroy() {
+                  if (session != null) {
+                      session.release();
+                  }
+                  super.onDestroy();
+              }
+          }
+          EOF_MEDIASERVICE_JAVA
+          cat > native/MainActivity.java <<'EOF_MAINACTIVITY_JAVA'
+          package __PKG__;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(MediaCtlPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          EOF_MAINACTIVITY_JAVA
+          cat > native/ic_stat_mushaf.xml <<'EOF_IC_STAT_MUSHAF_XML'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF" android:pathData="M12,6.5C10.5,5.6 8.6,5 6.5,5 4.9,5 3.4,5.3 2,6v13c1.4,-0.7 2.9,-1 4.5,-1 2.1,0 4,0.6 5.5,1.5 1.5,-0.9 3.4,-1.5 5.5,-1.5 1.6,0 3.1,0.3 4.5,1V6c-1.4,-0.7 -2.9,-1 -4.5,-1 -2.1,0 -4,0.6 -5.5,1.5z"/>
+          </vector>
+          EOF_IC_STAT_MUSHAF_XML
+          cat > native/manifest.py <<'EOF_MANIFEST_PY'
+          import sys
+          p = sys.argv[1]
+          s = open(p, encoding="utf8").read()
+          perms = ["POST_NOTIFICATIONS", "FOREGROUND_SERVICE", "FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+                   "SCHEDULE_EXACT_ALARM", "WAKE_LOCK", "ACCESS_COARSE_LOCATION", "ACCESS_FINE_LOCATION"]
+          add = "".join('    <uses-permission android:name="android.permission.%s" />\n' % x
+                        for x in perms if 'android.permission.%s"' % x not in s)
+          if 'android.hardware.location.gps' not in s:
+              add += '    <uses-feature android:name="android.hardware.location.gps" android:required="false" />\n'
+          if add:
+              s = s.replace("<application", add + "    <application", 1)
+          if "MediaService" not in s:
+              s = s.replace("</application>",
+                            '        <service android:name=".MediaService" android:exported="false" android:foregroundServiceType="mediaPlayback" />\n    </application>', 1)
+          open(p, "w", encoding="utf8").write(s)
+          EOF_MANIFEST_PY
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+
+      - run: npm install
+      - run: npx cap add android
+      - name: App icons
+        continue-on-error: true
+        run: npx capacitor-assets generate --android --assetPath assets
+      - run: npx cap sync android
+      - name: Version
+        run: sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName \"1.0\"/versionName \"4.0.${{ github.run_number }}\"/" android/app/build.gradle
+
+      - name: Build APK (with notification player, fallback without)
+        run: |
+          APPID=$(node -p "require('./capacitor.config.json').appId")
+          PKGDIR="android/app/src/main/java/$(echo "$APPID" | tr . /)"
+          MAIN="$PKGDIR/MainActivity.java"
+          mkdir -p android/app/src/main/res/drawable
+          cp native/ic_stat_mushaf.xml android/app/src/main/res/drawable/ic_stat_mushaf.xml
+          python3 native/manifest.py android/app/src/main/AndroidManifest.xml
+          cp "$MAIN" "$RUNNER_TEMP/MainActivity.bak"
+          for f in MediaCtlPlugin MediaService MainActivity; do sed "s/__PKG__/$APPID/g" "native/$f.java" > "$PKGDIR/$f.java"; done
+          cd android && chmod +x gradlew
+          if ! ./gradlew assembleDebug --no-daemon; then
+            echo "::warning::Notification player failed, building without it"
+            rm -f "../$PKGDIR/MediaCtlPlugin.java" "../$PKGDIR/MediaService.java"
+            cp "$RUNNER_TEMP/MainActivity.bak" "../$MAIN"
+            ./gradlew assembleDebug --no-daemon
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mushaf-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
